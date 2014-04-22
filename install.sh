@@ -11,7 +11,7 @@
 # Author:: Stephen Delano (stephen@opscode.com)
 # Author:: Seth Chisamore (sethc@opscode.com)
 # Author:: Lamont Granquist (lamont@opscode.com)
-# Copyright:: Copyright (c) 2010-2013 Opscode, Inc.
+# Copyright:: Copyright (c) 2010-2013 Chef Software, Inc.
 # License:: Apache License, Version 2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,11 +27,11 @@
 # limitations under the License.
 #
 
-# This is the current stable release to default to, with Omnibus patch level (e.g. 10.12.0-1)
-# Note that the chef template downloads 'x.y.z' not 'x.y.z-r' which should be a duplicate of the latest -r
-use_shell=0
-
 prerelease="false"
+
+nightlies="false"
+
+project="chef"
 
 # Check whether a command exists - returns 0 if it does, 1 if it does not
 exists() {
@@ -41,39 +41,6 @@ exists() {
   else
     return 1
   fi
-}
-
-# Set the filename for a deb, based on version and machine
-deb_filename() {
-  filetype="deb"
-  if test "$machine" = "x86_64"; then
-    filename="chef_${version}_amd64.deb"
-  else
-    filename="chef_${version}_i386.deb"
-  fi
-}
-
-# Set the filename for an rpm, based on version and machine
-rpm_filename() {
-  filetype="rpm"
-  filename="chef-${version}.${machine}.rpm"
-}
-
-# Set the filename for a Solaris SVR4 package, based on version and machine
-svr4_filename() {
-  filetype="solaris"
-  filename="chef-${version}.${machine}.solaris"
-}
-
-aix_filename() {
-  filetype="bff"
-  filename="chef-${version}.${machine}.bff"
-}
-
-# Set the filename for the sh archive
-shell_filename() {
-  filetype="sh"
-  filename="chef-${version}-${platform}-${platform_version}-${machine}.sh"
 }
 
 report_bug() {
@@ -87,17 +54,19 @@ report_bug() {
 }
 
 # Get command line arguments
-while getopts spv:f: opt
+while getopts pnv:f:d:P: opt
 do
   case "$opt" in
 
     v)  version="$OPTARG";;
-    s)  use_shell=1;;
     p)  prerelease="true";;
+    n)  nightlies="true";;
     f)  cmdline_filename="$OPTARG";;
+    P)  project="$OPTARG";;
+    d)  cmdline_dl_dir="$OPTARG";;
     \?)   # unknown flag
       echo >&2 \
-      "usage: $0 [-s] [-p] [-v version] [-f filename]"
+      "usage: $0 [-p] [-v version] [-f filename | -d download_dir]"
       exit 1;;
   esac
 done
@@ -106,7 +75,19 @@ shift `expr $OPTIND - 1`
 machine=`uname -m`
 os=`uname -s`
 
-# Retrieve Platform and Platform Version
+#
+# Platform and Platform Version detection
+#
+# NOTE: This should now match ohai platform and platform_version matching.
+# do not invented new platform and platform_version schemas, just make this behave
+# like what ohai returns as platform and platform_version for the server.
+#
+# ALSO NOTE: Do not mangle platform or platform_version here.  It is less error
+# prone and more future-proof to do that in the server, and then all omnitruck clients
+# will 'inherit' the changes (install.sh is not the only client of the omnitruck
+# endpoint out there).
+#
+
 if test -f "/etc/lsb-release" && grep -q DISTRIB_ID /etc/lsb-release; then
   platform=`grep DISTRIB_ID /etc/lsb-release | cut -d "=" -f 2 | tr '[A-Z]' '[a-z]'`
   platform_version=`grep DISTRIB_RELEASE /etc/lsb-release | cut -d "=" -f 2`
@@ -119,15 +100,19 @@ elif test -f "/etc/redhat-release"; then
 
   # If /etc/redhat-release exists, we act like RHEL by default
   if test "$platform" = "fedora"; then
+    # FIXME: stop remapping fedora to el
+    # FIXME: remove client side platform_version mangling and hard coded yolo
     # Change platform version for use below.
     platform_version="6.0"
   fi
+  # FIXME: use "redhat"
   platform="el"
 elif test -f "/etc/system-release"; then
   platform=`sed 's/^\(.\+\) release.\+/\1/' /etc/system-release | tr '[A-Z]' '[a-z]'`
   platform_version=`sed 's/^.\+ release \([.0-9]\+\).*/\1/' /etc/system-release | tr '[A-Z]' '[a-z]'`
   # amazon is built off of fedora, so act like RHEL
   if test "$platform" = "amazon linux ami"; then
+    # FIXME: remove client side platform_version mangling and hard coded yolo, and remapping to deprecated "el"
     platform="el"
     platform_version="6.0"
   fi
@@ -135,23 +120,17 @@ elif test -f "/etc/system-release"; then
 elif test -f "/usr/bin/sw_vers"; then
   platform="mac_os_x"
   # Matching the tab-space with sed is error-prone
-  platform_version=`sw_vers | awk '/^ProductVersion:/ { print $2 }'`
-
-  major_version=`echo $platform_version | cut -d. -f1,2`
-  case $major_version in
-    "10.6") platform_version="10.6" ;;
-    "10.7"|"10.8"|"10.9") platform_version="10.7" ;;
-    *) echo "No builds for platform: $major_version"
-       report_bug
-       exit 1
-       ;;
-  esac
+  platform_version=`sw_vers | awk '/^ProductVersion:/ { print $2 }' | cut -d. -f1,2`
 
   # x86_64 Apple hardware often runs 32-bit kernels (see OHAI-63)
   x86_64=`sysctl -n hw.optional.x86_64`
   if test $x86_64 -eq 1; then
     machine="x86_64"
   fi
+elif grep -q SmartOS /etc/release; then
+  platform="smartos"
+  machine=`/usr/bin/uname -p`
+  platform_version=`grep ^Image /etc/product | awk '{ print $3 }'`
 elif test -f "/etc/release"; then
   platform="solaris2"
   machine=`/usr/bin/uname -p`
@@ -180,16 +159,27 @@ if test "x$platform" = "x"; then
   exit 1
 fi
 
-# Mangle $platform_version to pull the correct build
-# for various platforms
+#
+# NOTE: platform manging in the install.sh is DEPRECATED
+#
+# - install.sh should be true to ohai and should not remap
+#   platform or platform versions.
+#
+# - remapping platform and mangling platform version numbers is
+#   now the complete responsibility of the server-side endpoints
+#
+
 major_version=`echo $platform_version | cut -d. -f1`
 case $platform in
+  # FIXME: should remove this case statement completely
   "el")
+    # FIXME:  "el" is deprecated, should use "redhat"
     platform_version=$major_version
     ;;
   "debian")
+    # FIXME: remove client-side yolo here
     case $major_version in
-      "5") platform_version="6";;
+      "5") platform_version="6";;  # FIXME: need to port this "reverse-yolo" into platform.rb
       "6") platform_version="6";;
       "7") platform_version="6";;
     esac
@@ -209,23 +199,6 @@ if test "x$platform_version" = "x"; then
   echo "Unable to determine platform version!"
   report_bug
   exit 1
-fi
-
-
-if test $use_shell = 1; then
-  shell_filename
-else
-  case $platform in
-    "ubuntu") deb_filename ;;
-    "debian") deb_filename ;;
-    "el") rpm_filename ;;
-    "suse") rpm_filename ;;
-    "sles") rpm_filename ;;
-    "fedora") rpm_filename ;;
-    "solaris2") svr4_filename ;;
-    "aix") aix_filename ;;
-    *) shell_filename ;;
-  esac
 fi
 
 if test "x$platform" = "xsolaris2"; then
@@ -354,37 +327,28 @@ do_python() {
   return 0
 }
 
+# returns 0 if checksums match
 do_checksum() {
   if exists sha256sum; then
+    echo "Comparing checksum with sha256sum..."
     checksum=`sha256sum $1 | awk '{ print $1 }'`
-    if test "x$checksum" != "x$2"; then
-      checksum_mismatch
-    else
-      echo "Checksum compare with sha256sum succeeded."
-    fi
+    return `test "x$checksum" = "x$2"`
   elif exists shasum; then
+    echo "Comparing checksum with shasum..."
     checksum=`shasum -a 256 $1 | awk '{ print $1 }'`
-    if test "x$checksum" != "x$2"; then
-      checksum_mismatch
-    else
-      echo "Checksum compare with shasum succeeded."
-    fi
+    return `test "x$checksum" = "x$2"`
   elif exists md5sum; then
+    echo "Comparing checksum with md5sum..."
     checksum=`md5sum $1 | awk '{ print $1 }'`
-    if test "x$checksum" != "x$3"; then
-      checksum_mismatch
-    else
-      echo "Checksum compare with md5sum succeeded."
-    fi
+    return `test "x$checksum" = "x$3"`
   elif exists md5; then
+    echo "Comparing checksum with md5..."
+    # this is for md5 utility on MacOSX (OSX 10.6-10.10) and $4 is the correct field
     checksum=`md5 $1 | awk '{ print $4 }'`
-    if test "x$checksum" != "x$3"; then
-      checksum_mismatch
-    else
-      echo "Checksum compare with md5 succeeded."
-    fi
+    return `test "x$checksum" = "x$3"`
   else
     echo "WARNING: could not find a valid checksum program, pre-install shasum, md5sum or md5 in your O/S image to get valdation..."
+    return 0
   fi
 }
 
@@ -440,9 +404,25 @@ install_file() {
       pkgrm -a /tmp/nocheck -n chef >/dev/null 2>&1 || true
       pkgadd -n -d "$2" -a /tmp/nocheck chef
       ;;
+    "pkg")
+      echo "installing with installer..."
+      cd / && /usr/sbin/installer -pkg "$2" -target /
+      ;;
+    "dmg")
+      echo "installing dmg file..."
+      hdiutil detach "/Volumes/chef_software" >/dev/null 2>&1 || true
+      hdiutil attach "$2" -mountpoint "/Volumes/chef_software"
+      cd / && /usr/sbin/installer -pkg `find "/Volumes/chef_software" -name \*.pkg` -target /
+      hdiutil detach "/Volumes/chef_software"
+      ;;
     "sh" )
       echo "installing with sh..."
       sh "$2"
+      ;;
+    *)
+      echo "Unknown filetype: $1"
+      report_bug
+      exit 1
       ;;
   esac
   if test $? -ne 0; then
@@ -465,13 +445,18 @@ tmp_dir="$tmp/install.sh.$$"
 
 metadata_filename="$tmp_dir/metadata.txt"
 
-if test "x$cmdline_filename" = "x"; then
-  download_filename="$tmp_dir/$filename"
-else
-  download_filename="$cmdline_filename"
-fi
-
-metadata_url="https://www.opscode.com/chef/metadata?v=${version}&prerelease=${prerelease}&p=${platform}&pv=${platform_version}&m=${machine}"
+case "$project" in
+  "chef")
+    metadata_url="https://www.opscode.com/chef/metadata?v=${version}&prerelease=${prerelease}&nightlies=${nightlies}&p=${platform}&pv=${platform_version}&m=${machine}"
+    ;;
+  "server")
+    metadata_url="https://www.opscode.com/chef/metadata-server?v=${version}&prerelease=${prerelease}&nightlies=${nightlies}&p=${platform}&pv=${platform_version}&m=${machine}"
+    ;;
+  "chefdk")
+    metadata_url="https://www.opscode.com/chef/metadata-chefdk?v=${version}&prerelease=${prerelease}&nightlies=${nightlies}&p=${platform}&pv=${platform_version}&m=${machine}"
+    ;;
+    *)
+esac
 
 if test "x$platform" = "xsolaris2"; then
   if test "x$platform_version" = "x5.9" -o "x$platform_version" = "x5.10"; then
@@ -504,12 +489,42 @@ if test "x$platform" = "xsolaris2"; then
   fi
 fi
 
-do_download "$download_url"  "$download_filename"
+filename=`echo $download_url | sed -e 's/^.*\///'`
+filetype=`echo $filename | sed -e 's/^.*\.//'`
+
+# use either $tmp_dir, the provided directory (-d) or the provided filename (-f)
+if test "x$cmdline_filename" != "x"; then
+  download_filename="$cmdline_filename"
+elif test "x$cmdline_dl_dir" != "x"; then
+  download_filename="$cmdline_dl_dir/$filename"
+else
+  download_filename="$tmp_dir/$filename"
+fi
+
+# ensure the parent directory where to download the installer always exists
+download_dir=`dirname $download_filename`
+(umask 077 && mkdir -p $download_dir) || exit 1
 
 sha256=`awk '$1 == "sha256" { print $2 }' "$metadata_filename"`
 md5=`awk '$1 == "md5" { print $2 }' "$metadata_filename"`
 
-do_checksum "$download_filename" "$sha256" "$md5"
+# check if we have that file locally available and if so verify the checksum
+cached_file_available="false"
+if test -f $download_filename; then
+  echo "$download_filename already exists, verifiying checksum..."
+  if do_checksum "$download_filename" "$sha256" "$md5"; then
+    echo "checksum compare succeeded, using existing file!"
+    cached_file_available="true"
+  else
+    echo "checksum mismatch, downloading latest version of the file"
+  fi
+fi
+
+# download if no local version of the file available
+if test "x$cached_file_available" != "xtrue"; then
+  do_download "$download_url"  "$download_filename"
+  do_checksum "$download_filename" "$sha256" "$md5" || checksum_mismatch
+fi
 
 if grep yolo "$metadata_filename" >/dev/null; then
   echo
@@ -523,4 +538,3 @@ install_file $filetype "$download_filename"
 if test "x$tmp_dir" != "x"; then
   rm -r "$tmp_dir"
 fi
-
